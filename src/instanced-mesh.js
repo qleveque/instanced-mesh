@@ -1,3 +1,22 @@
+// https://github.com/qleveque/instanced-mesh
+// forked from https://github.com/diarmidmackenzie/instanced-mesh
+// MIT License
+// Copyright (c) 2021 Diarmid Mackenzie
+// Modified 2022 Stéphane Lecorney
+// Modified 2023-2024 Quentin Lévêque
+
+/// Comments starting with /// document modifications of the original code
+
+/// Colors
+const setActiveGroupColor = function(activeObject, instanceId, color) {
+  for(const child of activeObject.parent.children) {
+    child.setColorAt(instanceId, color);
+    child.instanceColor.needsUpdate = true;
+  }
+}
+const activeColor = new THREE.Color('#cccccc');
+const noColor = new THREE.Color();
+
 AFRAME.registerComponent('instanced-mesh', {
   schema: {
       capacity:   {type: 'number', default: 100},
@@ -9,6 +28,8 @@ AFRAME.registerComponent('instanced-mesh', {
       updateMode: {type: 'string', default: "manual", oneOf: ["auto", "manual"]},
       decompose:  {type: 'boolean', default: false},
       drainColor: {type: 'boolean', default: false}
+      /// custom parameters
+      ,opacity: { type: 'number', default: 1 }
   },
 
   init: function () {
@@ -73,6 +94,31 @@ AFRAME.registerComponent('instanced-mesh', {
     this.color = new THREE.Color()
 
     this.addOnBeforeRenderToScene()
+
+    /// Ray casting in order to click on objects
+    this.raycaster = new THREE.Raycaster();
+    this.mouse = new THREE.Vector2(1, 1);
+    document.addEventListener('mousemove', event => {
+      this.mouse.x = (event.clientX / this.el.sceneEl.clientWidth) * 2 - 1;
+      this.mouse.y = -(event.clientY / this.el.sceneEl.clientHeight) * 2 + 1;
+    });
+    document.addEventListener('mousedown', event => {
+      if (event.target.tagName == 'A-SCENE') {
+        this.mouseDownSelectedId = this.selectedId;
+      }
+    });
+    document.addEventListener('mouseup', event => {
+      if (
+        this.selectedId &&
+        this.mouseDownSelectedId &&
+        this.selectedId === this.mouseDownSelectedId && // ensure click and not drag start / drag end
+        event.target.tagName == 'A-SCENE'
+      ) {
+        if(this.el.click) {
+          this.el.click(this.selectedId)
+        }
+      }
+    });
   },
 
   attachEventListeners: function() {
@@ -184,11 +230,28 @@ AFRAME.registerComponent('instanced-mesh', {
       this.componentOriginalColors = [];
 
       this.meshNodes.forEach((node, index) => {
+        /// handle opacity
+        if (this.data.opacity < 1) {
+          node.material.opacity = this.data.opacity;
+          node.material.transparent = true;
+        }
         const instancedMesh = new THREE.InstancedMesh(node.geometry,
                                                       node.material,
                                                       this.data.capacity);
         // mesh doesn't have any members yet
         instancedMesh.count = 0
+
+        /// Set no color by default
+        for (let i = 0; i < this.data.capacity; i++) {
+          instancedMesh.setColorAt(i, noColor);
+        }
+
+        /// Based on:
+        /// https://github.com/diarmidmackenzie/instanced-mesh/commit/e11ef1045d92f6b192efcfafcd008de46fb35b46
+        /// Since AFRAME 1.5.0, the mesh capacity behavior changed, and we have to specify the exact
+        /// number of instances at declaration.
+        /// We do not do that: counting the exact number of 3D payloads instances is too challenging.
+        instancedMesh.count = this.members;
 
         // For each instanced mesh required, we store off both the instanced mesh
         // itself. and the transform matrix for the component of the model that
@@ -271,6 +334,10 @@ AFRAME.registerComponent('instanced-mesh', {
           oldMesh.getColorAt(ii, this.color)
           newMesh.setColorAt(ii, this.color);
         }
+        /// initialize new meshes to noColor
+        for (ii = Math.min(oldMesh.count, this.data.capacity); ii < this.data.capacity; ii ++ ) {
+          newMesh.setColorAt(ii, noColor);
+        }
       }
 
       this.el.object3D.add(newMesh);
@@ -279,7 +346,8 @@ AFRAME.registerComponent('instanced-mesh', {
       // THREE.js docs say we should also all this when finished with an Instanced Mesh.
       // but doing so is causing an error.
       // So maybe we have a small leak as a result of not doing this, but I don't know how to fix...
-      // oldMesh.dispose();
+      /// We are confident about it
+      oldMesh.dispose();
     });
 
     this.instancedMeshes = newMeshes;
@@ -384,9 +452,11 @@ AFRAME.registerComponent('instanced-mesh', {
           partGeometries.forEach((partGeometry) => {
 
             // Use specified material; or default if none specified for this index
-            const material = this.cloneMaterial(node.material, index)
+            /// Properly drain color
+            let material = this.cloneMaterial(node.material, index)
             let color
             if (this.data.drainColor) {
+              material = new THREE.MeshBasicMaterial({ color: 0xffffff });
               color = this.drainColor(material)
             }
             else {
@@ -413,9 +483,11 @@ AFRAME.registerComponent('instanced-mesh', {
         // threejs limitation.
         // I don't yet have a reference for what that threejs limittation is, and
         // whether it still applies.
-        const material = this.cloneMaterial(node.material)
+        /// Properly drain color
+        let material = this.cloneMaterial(node.material)
         let color
         if (this.data.drainColor) {
+          material = new THREE.MeshBasicMaterial({ color: 0xffffff });
           color = this.drainColor(material)
         }
 
@@ -624,6 +696,10 @@ AFRAME.registerComponent('instanced-mesh', {
       // member has specified a color for the relevant index.
       color.set(colors[colorIndex])
     }
+    /// in case not enough colors are specified, consider the first color
+    else if (colors.length && colors.length <= colorIndex) {
+      color.set(colors[0])
+    }
     else if (this.componentOriginalColors[componentIndex]) {
       color.copy(this.componentOriginalColors[componentIndex])
     }
@@ -786,6 +862,43 @@ AFRAME.registerComponent('instanced-mesh', {
     }
   },
 
+  /// tock function to handle object click
+  tock: function (time, timeDelta, camera) {
+    if (!this.meshLoaded) {
+      return;
+    }
+    const mesh = this.el.object3D;
+    this.raycaster.setFromCamera(this.mouse, camera);
+    const intersection = this.raycaster.intersectObject(mesh);
+    if (intersection.length > 0) {
+      const instanceId = intersection[0].instanceId;
+      if (this.instanceId === instanceId) {
+        return;
+      } else if (this.activeObject) {
+        // remove hover on previousobject
+        setActiveGroupColor(this.activeObject, this.instanceId, noColor);
+      }
+      this.instanceId = intersection[0].instanceId;
+      let selected = this.orderedMembersList[this.instanceId];
+      if (selected != undefined) {
+        this.selectedId = selected.id;
+      }
+      this.activeObject = intersection[0].object;
+      setActiveGroupColor(this.activeObject, this.instanceId, activeColor);
+      // change cursor
+      this.el.sceneEl.canvas.style.cursor = 'pointer';
+    } else {
+      if (this.activeObject !== undefined) {
+        setActiveGroupColor(this.activeObject, this.instanceId, noColor)
+        // change back cursor
+        this.el.sceneEl.canvas.style.cursor = 'default';
+        this.activeObject = undefined;
+      }
+      this.instanceId = undefined;
+      this.selectedId = undefined;
+    }
+  },
+
   // perform any updates needed ahead of rendering
   // - in auto update mode, update all matrices
   // - (TO DO) manual update mode, update those 
@@ -797,6 +910,8 @@ AFRAME.registerComponent('instanced-mesh', {
 
     // update this.parentWorldMatrixInverse, which will be used in matrix calculations.
     const parent = this.el.object3D.parent
+    /// PREVENT HARD CRASH
+    if(!parent) return;
     const parentInverse = this.parentWorldMatrixInverse
     parentInverse.copy(parent.matrixWorld)
     parentInverse.invert()
@@ -846,6 +961,8 @@ AFRAME.registerComponent('instanced-mesh-member', {
         debug:      {type: 'boolean', default: false},
         memberMesh: {type: 'boolean', default: false},
         colors:     {type: 'array'}
+      /// add visible parameter
+      , visible: { type: 'boolean', default: true }
   },
 
   init: function() {
@@ -860,9 +977,20 @@ AFRAME.registerComponent('instanced-mesh-member', {
     // Some state we track, to help make the right updates to the Instanced Mesh.
     this.visible = this.el.object3D.visible;
     this.colors = this.data.colors;
+
+    /// Adapt z scale
+    this.el.object3D.scale.z *= -1;
+
   },
 
-  update: function () {
+  /// check if mesh changed (e.g. refresh devices on map if status changed)
+  update: function (oldData) {
+    if (oldData?.mesh && oldData.mesh !== this.data.mesh) {
+      oldData.mesh.emit('memberRemoved', { member: this.el });
+      this.visible = false;
+      this.added = false;
+    }
+
     // look for changes to be mirrored to the Mesh.
     if (this.visible) {
       // Object was previously visible.  But might not be any more...
@@ -930,6 +1058,8 @@ AFRAME.registerComponent('instanced-mesh-member', {
         //console.log(`Position: ${this.el.object3D.position.x} ${this.el.object3D.position.y}`)
         console.log("Added:" + this.el.id);
       }
+      /// PREVENT HARD CRASH
+      if(!this.data.mesh) return;
       this.data.mesh.emit('memberAdded', {member: this.el});
       this.added = true;
     }
