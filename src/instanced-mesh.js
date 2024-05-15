@@ -686,6 +686,10 @@ AFRAME.registerComponent('instanced-mesh', {
       // member has specified a color for the relevant index.
       color.set(colors[colorIndex])
     }
+    /// in case not enough colors are specified, consider the first color
+    else if (colors.length && colors.length <= colorIndex) {
+      color.set(colors[0])
+    }
     else if (this.componentOriginalColors[componentIndex]) {
       color.copy(this.componentOriginalColors[componentIndex])
     }
